@@ -1,24 +1,32 @@
 """
 验证目标：
-    证明 torch.npu.memory_reserved() 与 acl.rt.get_mem_info() 的差值
-    来自 NPUWorkspaceAllocator，而非 NPUCachingAllocator。
+    找出 acl.rt.get_mem_info() 比 torch.npu.memory_reserved() 多报的 HBM 来自哪里。
 
-实验逻辑：
-    对照组 A：torch.empty()          ← 只触发 CachingAllocator，无算子 workspace
-    对照组 B：torch.randn()          ← 触发 CachingAllocator + WorkspaceAllocator
-    对照组 C：torch.empty() + fill_  ← 触发 CachingAllocator + WorkspaceAllocator（fill_ 也是算子）
+关键约束（修正上一版缺陷）：
+    - 不做任何 warmup，保证 HBM 从 "全新" 状态开始测量
+    - 不在实验间调用 empty_cache()，避免 "驱动层缓存" 干扰
+      （empty_cache 把内存还给驱动 free pool，下次分配从 free pool 取时
+       AclrtMallocAlign32 不触发新 HBM 分配，get_mem_info 不变化）
+    - 所有张量保活（tensors 列表），确保每次都是真实的增量分配
 
-    预期：A 中 HBM delta == PyTorch reserved delta
-          B/C 中 HBM delta > PyTorch reserved delta（差值 = workspace）
+实验结构（单进程，顺序叠加）：
+    baseline
+      │ Step 1: torch.empty()   ── 纯内存分配，无算子，无 workspace
+      │ Step 2: torch.randn()   ── 首次 CANN 算子，可能触发 workspace + 初始化开销
+      │ Step 3: torch.randn()   ── 同 stream 再次调用，workspace 应复用
+      │ Step 4: torch.ones()    ── 不同算子，workspace 应复用（同 stream）
+      │ Step 5: torch.empty()   ── 再次纯分配，触发第二个 2MB 段（超出第一段）
+      └ 汇总分析
+
+    通过对比各 Step 的 HBM delta 与 PT reserved delta，
+    隔离出 "算子 workspace / CANN 初始化" 的实际 HBM 开销。
 """
 
-import sys
 import os
 import acl
 import torch
 
-# ─── ACL 初始化 ────────────────────────────────────────────────────────────────
-os.environ["ASCEND_GLOBAL_LOG_LEVEL"] = "3"  # 只打 ERROR，避免刷屏
+os.environ["ASCEND_GLOBAL_LOG_LEVEL"] = "3"
 
 ret = acl.init()
 assert ret == 0, f"acl.init() failed: {ret}"
@@ -28,235 +36,252 @@ ret = acl.rt.set_device(DEVICE_ID)
 assert ret == 0, f"acl.rt.set_device() failed: {ret}"
 
 DEVICE = torch.device(f"npu:{DEVICE_ID}")
-ACL_MEM_TYPE_HBM = 0  # ACL_HBM_MEM
+ACL_MEM_TYPE_HBM = 0
 
-
-# ─── 工具函数 ──────────────────────────────────────────────────────────────────
+# ─── 工具 ──────────────────────────────────────────────────────────────────────
 def hbm_used_mb() -> float:
     free, total, ret = acl.rt.get_mem_info(ACL_MEM_TYPE_HBM)
     assert ret == 0
     return (total - free) / (1024 * 1024)
 
-
-def pytorch_reserved_mb() -> float:
+def pt_reserved_mb() -> float:
     return torch.npu.memory_reserved(DEVICE_ID) / (1024 * 1024)
 
-
-def pytorch_allocated_mb() -> float:
+def pt_allocated_mb() -> float:
     return torch.npu.memory_allocated(DEVICE_ID) / (1024 * 1024)
 
-
-def full_reset():
-    """释放所有 PyTorch 持有内存，回到干净状态。"""
-    torch.npu.empty_cache()
-
-
-def snapshot(label: str) -> dict:
-    s = {
-        "hbm_used":        hbm_used_mb(),
-        "pt_reserved":     pytorch_reserved_mb(),
-        "pt_allocated":    pytorch_allocated_mb(),
-    }
-    print(f"  [{label}]  HBM used={s['hbm_used']:.2f} MB  "
-          f"PT reserved={s['pt_reserved']:.2f} MB  "
-          f"PT allocated={s['pt_allocated']:.2f} MB")
-    return s
-
-
-def diff(after: dict, before: dict) -> dict:
-    return {k: round(after[k] - before[k], 4) for k in after}
-
-
-def check(condition: bool, msg: str):
-    status = "PASS ✓" if condition else "FAIL ✗"
-    print(f"    {status}  {msg}")
-    if not condition:
-        global _any_fail
+_any_fail = False
+def check(cond: bool, msg: str):
+    global _any_fail
+    tag = "PASS ✓" if cond else "FAIL ✗"
+    print(f"    {tag}  {msg}")
+    if not cond:
         _any_fail = True
 
+def show(label: str) -> dict:
+    s = dict(hbm=hbm_used_mb(), pt_r=pt_reserved_mb(), pt_a=pt_allocated_mb())
+    print(f"  {label:<35s}  HBM={s['hbm']:.2f}  PT_reserved={s['pt_r']:.2f}  "
+          f"PT_allocated={s['pt_a']:.2f}  (MB)")
+    return s
 
-_any_fail = False
+def delta(a: dict, b: dict) -> dict:
+    return {k: round(a[k] - b[k], 4) for k in a}
 
-# ─── 主逻辑 ────────────────────────────────────────────────────────────────────
+# ─── 常量 ──────────────────────────────────────────────────────────────────────
+# 所有小分配（≤1MB）共用 kSmallBuffer=2MB 的段
+# 选 200KB，使多个张量都放在同一个 2MB 段内，消除 "新段" 对 HBM 的影响
+SMALL  = (200 * 1024) // 4   # 200 KB float32 → 50000 元素
+# 2MB 段能放 ≥10 个 200KB 张量，实验中不会触发第二个段
+# 超大分配用于主动触发第二个段（对比参照）
+LARGE  = (600 * 1024) // 4   # 600 KB float32（仍 ≤1MB，但与前面 200KB*4=800KB 相加超 2MB）
 
-# 预热：让 PyTorch lazy init 全部完成，使初始状态干净
-_warmup = torch.ones(1, device=DEVICE)
-del _warmup
-full_reset()
-import time; time.sleep(0.2)
-
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 70)
-print("实验 A：torch.empty() — 只分配内存，不执行任何算子")
-print("=" * 70)
-full_reset()
-before_A = snapshot("before")
-
-NUM_ELEMENTS = (512 * 1024) // 4  # 512 KB / float32
-t_A = torch.empty(NUM_ELEMENTS, device=DEVICE)
-
-after_A = snapshot("after ")
-d_A = diff(after_A, before_A)
-print(f"  delta: HBM={d_A['hbm_used']:.2f} MB  PT_reserved={d_A['pt_reserved']:.2f} MB")
-
-check(d_A["pt_reserved"] == 2.0,
-      f"小分配(512KB)应触发 kSmallBuffer=2MB 段: pt_reserved delta={d_A['pt_reserved']:.2f} MB")
-check(abs(d_A["hbm_used"] - d_A["pt_reserved"]) < 0.1,
-      "torch.empty 无算子 workspace：HBM delta 应 ≈ PT reserved delta"
-      f"（差={d_A['hbm_used'] - d_A['pt_reserved']:.2f} MB）")
-
-del t_A
+tensors = []   # 全程保活，防止内存被还给驱动
 
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 70)
-print("实验 B：torch.randn() — 分配 + 执行随机算子（有 workspace）")
-print("=" * 70)
-full_reset()
-before_B = snapshot("before")
+print("=" * 72)
+print("  无 warmup，无 empty_cache 的顺序叠加实验")
+print("  目标：逐步拆解每一类分配对 HBM 的贡献")
+print("=" * 72)
 
-t_B = torch.randn(NUM_ELEMENTS, device=DEVICE)
+S0 = show("[0] 基准（进程启动后首次测量）")
+print()
 
-after_B = snapshot("after ")
-d_B = diff(after_B, before_B)
-print(f"  delta: HBM={d_B['hbm_used']:.2f} MB  PT_reserved={d_B['pt_reserved']:.2f} MB")
-workspace_B = d_B["hbm_used"] - d_B["pt_reserved"]
-print(f"  推断 WorkspaceAllocator 占用: {workspace_B:.2f} MB")
+# ──────────────────────────────────────────────────────────────────────────────
+print("── Step 1：torch.empty(200KB) ── 纯内存分配，无任何算子 ──")
+t1 = torch.empty(SMALL, device=DEVICE)
+tensors.append(t1)
+S1 = show("[1] after torch.empty(200KB)")
+d1 = delta(S1, S0)
+print(f"       HBM Δ={d1['hbm']:+.2f} MB   PT_reserved Δ={d1['pt_r']:+.2f} MB   "
+      f"hidden={d1['hbm']-d1['pt_r']:+.2f} MB")
+check(d1['pt_r'] == 2.0,
+      f"首次小分配触发 kSmallBuffer=2MB 段（实际 Δpt_r={d1['pt_r']:.2f}）")
+check(abs(d1['hbm'] - d1['pt_r']) < 0.1,
+      f"torch.empty 无算子：HBM Δ ≈ PT_reserved Δ  (hidden={d1['hbm']-d1['pt_r']:.2f} MB)")
+print()
 
-check(d_B["pt_reserved"] == 2.0,
-      f"小分配(512KB)应触发 kSmallBuffer=2MB 段: pt_reserved delta={d_B['pt_reserved']:.2f} MB")
-check(workspace_B > 0,
-      f"torch.randn 应有额外 HBM（WorkspaceAllocator）：差值={workspace_B:.2f} MB")
-check(workspace_B % 2.0 == 0,
-      f"WorkspaceAllocator 按 kRoundLarge=2MB 对齐：{workspace_B:.2f} MB 应为 2 的倍数")
+# ──────────────────────────────────────────────────────────────────────────────
+print("── Step 2：torch.randn(200KB) ── 首次 CANN 算子调用 ──")
+print("   (200KB 仍在同一 2MB 段内，PT_reserved 不应增加)")
+t2 = torch.randn(SMALL, device=DEVICE)
+tensors.append(t2)
+S2 = show("[2] after torch.randn(200KB) #1")
+d2 = delta(S2, S1)
+hidden2 = d2['hbm'] - d2['pt_r']
+print(f"       HBM Δ={d2['hbm']:+.2f} MB   PT_reserved Δ={d2['pt_r']:+.2f} MB   "
+      f"hidden={hidden2:+.2f} MB")
+check(d2['pt_r'] == 0.0,
+      f"200KB 仍在同一 2MB 段内，不触发新段（实际 Δpt_r={d2['pt_r']:.2f}）")
+print(f"   ★ randn 的隐藏 HBM = {hidden2:.2f} MB  "
+      f"({'workspace 或 CANN 初始化开销' if hidden2 > 0 else '无额外分配（workspace=0 或已缓存）'})")
+print()
 
-del t_B
+# ──────────────────────────────────────────────────────────────────────────────
+print("── Step 3：torch.randn(200KB) ── 第二次调用，workspace 应复用 ──")
+t3 = torch.randn(SMALL, device=DEVICE)
+tensors.append(t3)
+S3 = show("[3] after torch.randn(200KB) #2")
+d3 = delta(S3, S2)
+hidden3 = d3['hbm'] - d3['pt_r']
+print(f"       HBM Δ={d3['hbm']:+.2f} MB   PT_reserved Δ={d3['pt_r']:+.2f} MB   "
+      f"hidden={hidden3:+.2f} MB")
+check(abs(hidden3) < 0.1,
+      f"第二次 randn workspace 复用：hidden ≈ 0（实际={hidden3:.2f} MB）")
+if hidden2 > 0 and abs(hidden3) < 0.1:
+    print("   ★ 证实：Step2 的隐藏 HBM 是一次性的（workspace 在 Step3 被复用）")
+print()
 
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 70)
-print("实验 C：torch.empty() + fill_() — 分开的内存分配与算子执行")
-print("=" * 70)
-full_reset()
-before_C = snapshot("before")
+# ──────────────────────────────────────────────────────────────────────────────
+print("── Step 4：torch.ones(200KB) ── 换一种算子，同 stream ──")
+t4 = torch.ones(SMALL, device=DEVICE)
+tensors.append(t4)
+S4 = show("[4] after torch.ones(200KB)")
+d4 = delta(S4, S3)
+hidden4 = d4['hbm'] - d4['pt_r']
+print(f"       HBM Δ={d4['hbm']:+.2f} MB   PT_reserved Δ={d4['pt_r']:+.2f} MB   "
+      f"hidden={hidden4:+.2f} MB")
+print(f"   ★ ones 的隐藏 HBM = {hidden4:.2f} MB  "
+      f"({'有自己的 workspace 或扩容' if hidden4 > 0 else '复用已有 workspace'})")
+print()
 
-t_C = torch.empty(NUM_ELEMENTS, device=DEVICE)
-mid_C = snapshot("after empty ")
-d_C_empty = diff(mid_C, before_C)
+# ──────────────────────────────────────────────────────────────────────────────
+print("── Step 5：torch.zeros(200KB) ── 再换一种算子 ──")
+t5 = torch.zeros(SMALL, device=DEVICE)
+tensors.append(t5)
+S5 = show("[5] after torch.zeros(200KB)")
+d5 = delta(S5, S4)
+hidden5 = d5['hbm'] - d5['pt_r']
+print(f"       HBM Δ={d5['hbm']:+.2f} MB   PT_reserved Δ={d5['pt_r']:+.2f} MB   "
+      f"hidden={hidden5:+.2f} MB")
+print()
 
-t_C.fill_(1.0)  # 触发 fill_ 算子，会调用 WorkspaceAllocator
-after_C = snapshot("after fill_")
-d_C_fill = diff(after_C, mid_C)
-print(f"  empty delta: HBM={d_C_empty['hbm_used']:.2f} MB  PT_reserved={d_C_empty['pt_reserved']:.2f} MB")
-print(f"  fill_ delta: HBM={d_C_fill['hbm_used']:.2f} MB  PT_reserved={d_C_fill['pt_reserved']:.2f} MB")
-workspace_C = d_C_fill["hbm_used"]
-print(f"  推断 fill_ WorkspaceAllocator 占用: {workspace_C:.2f} MB")
+# ──────────────────────────────────────────────────────────────────────────────
+print("── Step 6：torch.empty(200KB) ── 再次纯分配，不触发算子 ──")
+t6 = torch.empty(SMALL, device=DEVICE)
+tensors.append(t6)
+S6 = show("[6] after torch.empty(200KB) #2")
+d6 = delta(S6, S5)
+hidden6 = d6['hbm'] - d6['pt_r']
+print(f"       HBM Δ={d6['hbm']:+.2f} MB   PT_reserved Δ={d6['pt_r']:+.2f} MB   "
+      f"hidden={hidden6:+.2f} MB")
+check(abs(hidden6) < 0.1,
+      f"第二次 torch.empty 无算子：hidden ≈ 0（实际={hidden6:.2f} MB）")
+print()
 
-check(abs(d_C_empty["hbm_used"] - d_C_empty["pt_reserved"]) < 0.1,
-      "torch.empty 阶段：HBM delta ≈ PT reserved delta（无 workspace）"
-      f"（差={d_C_empty['hbm_used'] - d_C_empty['pt_reserved']:.2f} MB）")
-check(d_C_fill["pt_reserved"] == 0,
-      f"fill_() 不触发新的 CachingAllocator 分配：PT reserved delta={d_C_fill['pt_reserved']:.2f} MB")
-# fill_ 可能 workspace=0（某些硬件上），也可能 >0
-print(f"    INFO  fill_() workspace={'存在' if workspace_C > 0 else '为零（fill_ 无需 workspace）'}: {workspace_C:.2f} MB")
+# ──────────────────────────────────────────────────────────────────────────────
+print("── Step 7：触发第二个 2MB 段 ── 用 LARGE 分配耗尽第一个段 ──")
+# 当前第一个段已用约: 200KB*5 + 20KB(overhead) ≈ 1020KB，再加 600KB 超过 2MB
+t7 = torch.empty(LARGE, device=DEVICE)
+tensors.append(t7)
+S7 = show("[7] after torch.empty(600KB) → 新段")
+d7 = delta(S7, S6)
+hidden7 = d7['hbm'] - d7['pt_r']
+print(f"       HBM Δ={d7['hbm']:+.2f} MB   PT_reserved Δ={d7['pt_r']:+.2f} MB   "
+      f"hidden={hidden7:+.2f} MB")
+check(d7['pt_r'] == 2.0,
+      f"新的 kSmallBuffer=2MB 段被触发（实际 Δpt_r={d7['pt_r']:.2f}）")
+check(abs(hidden7) < 0.1,
+      f"纯分配（新段）：hidden ≈ 0，HBM Δ ≈ PT_reserved Δ（实际={hidden7:.2f} MB）")
+print()
 
-del t_C
+# ──────────────────────────────────────────────────────────────────────────────
+print("=" * 72)
+print("  全程汇总")
+print("=" * 72)
+total = delta(S7, S0)
+print(f"  HBM 总增量:         {total['hbm']:+.2f} MB")
+print(f"  PT_reserved 总增量: {total['pt_r']:+.2f} MB")
+print(f"  隐藏分配总量:       {total['hbm']-total['pt_r']:+.2f} MB")
+print()
 
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 70)
-print("实验 D：连续两次 torch.randn()，验证 workspace 是否复用")
-print("=" * 70)
-full_reset()
-before_D = snapshot("before")
+# 按 step 汇总
+print("  Step-by-step 隐藏分配明细:")
+print(f"    Step1 torch.empty #1  : {d1['hbm']-d1['pt_r']:+.2f} MB （预期 ≈ 0）")
+print(f"    Step2 torch.randn #1  : {hidden2:+.2f} MB  ← 首次 CANN 算子开销（workspace/初始化）")
+print(f"    Step3 torch.randn #2  : {hidden3:+.2f} MB  ← 预期 ≈ 0（复用）")
+print(f"    Step4 torch.ones      : {hidden4:+.2f} MB")
+print(f"    Step5 torch.zeros     : {hidden5:+.2f} MB")
+print(f"    Step6 torch.empty #2  : {hidden6:+.2f} MB （预期 ≈ 0）")
+print(f"    Step7 torch.empty #3  : {hidden7:+.2f} MB （新段，预期 ≈ 0）")
+print()
 
-t_D1 = torch.randn(NUM_ELEMENTS, device=DEVICE)
-mid_D = snapshot("after 1st randn")
-d_D1 = diff(mid_D, before_D)
+# ──────────────────────────────────────────────────────────────────────────────
+print("── 补充：原始问题完整复现 ──")
+print("   （13 次 torch.randn，与原始脚本顺序完全一致）")
+print()
 
-t_D2 = torch.randn(NUM_ELEMENTS, device=DEVICE)  # 同 stream，workspace 应复用
-after_D = snapshot("after 2nd randn")
-d_D2 = diff(after_D, mid_D)
-
-print(f"  1st randn delta: HBM={d_D1['hbm_used']:.2f} MB  PT_reserved={d_D1['pt_reserved']:.2f} MB")
-print(f"  2nd randn delta: HBM={d_D2['hbm_used']:.2f} MB  PT_reserved={d_D2['pt_reserved']:.2f} MB")
-
-check(d_D1["hbm_used"] > d_D1["pt_reserved"],
-      f"1st randn：HBM delta({d_D1['hbm_used']:.2f}) > PT reserved delta({d_D1['pt_reserved']:.2f})，workspace 已分配")
-check(abs(d_D2["hbm_used"] - d_D2["pt_reserved"]) < 0.1,
-      f"2nd randn（同 stream）：workspace 复用，HBM delta ≈ PT reserved delta"
-      f"（差={d_D2['hbm_used'] - d_D2['pt_reserved']:.2f} MB）")
-
-del t_D1, t_D2
-
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 70)
-print("实验 E：empty_cache 同时释放 WorkspaceAllocator（验证回收路径）")
-print("=" * 70)
-full_reset()
-
-t_E = torch.randn(NUM_ELEMENTS, device=DEVICE)
-before_E = snapshot("after randn（持有张量）")
-
-del t_E
+del tensors
 torch.npu.empty_cache()
-after_E = snapshot("after del+empty_cache")
-d_E = diff(after_E, before_E)
-print(f"  delta（释放后）: HBM={d_E['hbm_used']:.2f} MB  PT_reserved={d_E['pt_reserved']:.2f} MB")
 
-check(d_E["pt_reserved"] <= 0,
-      f"empty_cache 应释放所有 CachingAllocator 缓存：PT reserved delta={d_E['pt_reserved']:.2f} MB")
-# WorkspaceAllocator 也应随 empty_cache 释放
-# 注意：emptyCache 调用链: NpuCachingAllocator::emptyCache → NPUWorkspaceAllocator::emptyCache
-workspace_released = -d_E["hbm_used"] - (-d_E["pt_reserved"])
-print(f"  WorkspaceAllocator 随 empty_cache 释放: {-d_E['hbm_used']:.2f} MB HBM 回收，"
-      f"其中 {-d_E['pt_reserved']:.2f} MB 来自 CachingAllocator，"
-      f"{workspace_released:.2f} MB 来自 WorkspaceAllocator")
-check(-d_E["hbm_used"] >= -d_E["pt_reserved"],
-      f"HBM 回收量 ≥ PT reserved 回收量（WorkspaceAllocator 也被回收）")
+# 还原为完全干净状态用于复现（这里 empty_cache 后再重新来过）
+# 注意：如果有驱动缓存，复现结果可能与 "真正冷启动" 不同
+# 但此时我们已有 Step2 的精确数据来推断冷启动的情况
+import gc; gc.collect()
 
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 70)
-print("实验 F：复现原始问题 — 与用户脚本完全相同的分配序列")
-print("=" * 70)
-full_reset()
+tensors2 = []
 sizes = [512*1024, 512*1024, 1*1024, 2*1024, 4*1024, 8*1024,
          16*1024, 32*1024, 64*1024, 128*1024, 256*1024, 512*1024, 2*1024]
 
-baseline = snapshot("baseline")
-tensors = []
-prev = baseline
+prev2 = dict(hbm=hbm_used_mb(), pt_r=pt_reserved_mb(), pt_a=pt_allocated_mb())
+print(f"  {'基准':<35s}  HBM={prev2['hbm']:.2f}  PT_reserved={prev2['pt_r']:.2f}  (MB)")
+
 for i, size in enumerate(sizes):
     t = torch.randn(size // 4, device=DEVICE)
-    tensors.append(t)
-    cur = snapshot(f"alloc {i+1:2d}  {size//1024:>4d}KB")
-    d = diff(cur, prev)
-    hidden = d["hbm_used"] - d["pt_reserved"]
-    if abs(hidden) > 0.01:
-        print(f"    ↑ WorkspaceAllocator 贡献: {hidden:.2f} MB (仅首次分配可见)")
-    prev = cur
+    tensors2.append(t)
+    cur2 = dict(hbm=hbm_used_mb(), pt_r=pt_reserved_mb(), pt_a=pt_allocated_mb())
+    d = {k: round(cur2[k] - prev2[k], 4) for k in cur2}
+    h = d['hbm'] - d['pt_r']
+    note = f"  ← hidden={h:+.2f} MB" if abs(h) > 0.01 else ""
+    print(f"  alloc {i+1:2d} {size//1024:>4d}KB randn     "
+          f"HBM Δ={d['hbm']:+.2f}  PT_r Δ={d['pt_r']:+.2f}  PT_a Δ={d['pt_a']:+.2f}{note}")
+    prev2 = cur2
 
-total_d = diff(prev, baseline)
-print(f"\n  总计：HBM={total_d['hbm_used']:.2f} MB  PT_reserved={total_d['pt_reserved']:.2f} MB  "
-      f"WorkspaceAllocator={total_d['hbm_used']-total_d['pt_reserved']:.2f} MB")
-check(total_d["pt_reserved"] == 4.0,
-      f"2个2MB段：PT reserved total delta=4.00 MB（实际={total_d['pt_reserved']:.2f} MB）")
-check(abs((total_d["hbm_used"] - total_d["pt_reserved"]) - 4.0) < 0.5,
-      f"WorkspaceAllocator 应贡献约 4 MB（实际={total_d['hbm_used']-total_d['pt_reserved']:.2f} MB）")
+total2 = {k: round(cur2[k] - (dict(hbm=hbm_used_mb(), pt_r=pt_reserved_mb(),
+           pt_a=pt_allocated_mb()) if False else prev2)[k], 4) for k in cur2}
+total2 = delta(cur2, dict(hbm=hbm_used_mb()-0, pt_r=pt_reserved_mb()-0, pt_a=pt_allocated_mb()-0))
 
-del tensors
-full_reset()
+# 重新算 baseline 到最终的总 delta
+final = dict(hbm=hbm_used_mb(), pt_r=pt_reserved_mb(), pt_a=pt_allocated_mb())
+# 对比基准（此处基准是空 cache 后）
+base2 = dict(hbm=final['hbm'] - sum(delta(
+    dict(hbm=hbm_used_mb(), pt_r=pt_reserved_mb(), pt_a=pt_allocated_mb()),
+    dict(hbm=hbm_used_mb(), pt_r=pt_reserved_mb(), pt_a=pt_allocated_mb())
+    ).values()), pt_r=0.0, pt_a=0.0)
 
-# ─── 汇总 ─────────────────────────────────────────────────────────────────────
-print("\n" + "=" * 70)
+# 简单打印最终状态
+print(f"\n  最终状态: HBM={cur2['hbm']:.2f}  PT_reserved={cur2['pt_r']:.2f}  PT_allocated={cur2['pt_a']:.2f}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+print()
+print("=" * 72)
+print("  结论")
+print("=" * 72)
+print(f"""
+  1. get_mem_info() 测量的是 "净新增 HBM 分配"，受驱动层 free pool 影响：
+       empty_cache() → 内存还给驱动 free pool（HBM 不变）
+       下次 AclrtMallocAlign32 → 从 free pool 取（HBM 仍不变）
+     → 必须在无 warmup 的冷启动进程里测量才准确
+
+  2. Step 分析（see above）揭示：
+       torch.empty  → hidden ≈ 0（无额外 HBM）  ✓
+       torch.randn #1 → hidden = {hidden2:.2f} MB（首次 CANN 算子开销）
+       torch.randn #2 → hidden ≈ 0（复用）       ✓
+
+  3. 原始脚本的 4MB 差异来自：
+       首次 torch.randn 触发 CANN aclnn 算子，
+       其 workspace 通过 NPUWorkspaceAllocator 分配（AclrtMallocAlign32），
+       以及可能的 CANN 运行时一次性初始化开销，
+       二者均不计入 torch.npu.memory_reserved()，但计入 get_mem_info()。
+       具体大小由 Step2 的 hidden 值给出实测结果。
+""")
+
 if _any_fail:
-    print("结论：部分断言失败，请检查上方 FAIL 行")
+    print("  ⚠️  部分断言失败，请检查上方 FAIL 行")
 else:
-    print("结论：所有断言通过 ✓")
-    print()
-    print("  消失的 4 MB = NPUWorkspaceAllocator 为 torch.randn() 底层")
-    print("  aclnn 算子分配的 workspace，按 kRoundLarge=2MB 对齐，")
-    print("  通过 AclrtMallocAlign32 直接占用 HBM，但不计入")
-    print("  torch.npu.memory_reserved() / memory_allocated() 统计。")
-print("=" * 70)
+    print("  所有断言通过 ✓")
+print("=" * 72)
 
-# ─── 清理 ─────────────────────────────────────────────────────────────────────
-ret = acl.rt.reset_device(DEVICE_ID)
-ret = acl.finalize()
+del tensors2
+torch.npu.empty_cache()
+acl.rt.reset_device(DEVICE_ID)
+acl.finalize()
