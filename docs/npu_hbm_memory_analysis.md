@@ -137,13 +137,13 @@ static void initGlobalStreamState() {
     NPU_CHECK_ERROR(acl::AclrtCreateStreamWithConfig(
         &default_streams[device_id].stream,
         0,
-        ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC));   // ← fast-sync stream
+        ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC));   // ← FAST_LAUNCH 触发预申请
 
     // 创建 secondary stream
     NPU_CHECK_ERROR(acl::AclrtCreateStreamWithConfig(
         &secondary_streams[device_id].stream,
         0,
-        ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC));   // ← fast-sync stream
+        ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC));   // ← FAST_LAUNCH 触发预申请
 }
 ```
 
@@ -151,15 +151,20 @@ static void initGlobalStreamState() {
 
 ### 4.3 CANN 内部 HBM 分配
 
-`ACL_STREAM_FAST_SYNC` 是 CANN 提供的硬件级同步机制。与普通 stream 依赖软件轮询不同，`ACL_STREAM_FAST_SYNC` stream 需要在 HBM 中维护**同步原语缓冲区**（如 mailbox 或 semaphore ring buffer），用于实现 CPU↔NPU 之间的低延迟事件通知。
+两个 flag 的代价各不相同（引自 CANN 官方文档）：
 
-CANN 在 `AclrtCreateStreamWithConfig` 内部完成这块 HBM 的分配，**完全不经过 torch-npu 的任何分配器**，因此：
+| flag | 代价 |
+|---|---|
+| `ACL_STREAM_FAST_LAUNCH` | **增加内存消耗**：创建 stream 时预申请系统内部资源，换取后续下发任务时延缩短 |
+| `ACL_STREAM_FAST_SYNC` | **增加 CPU 消耗**：`aclrtSynchronizeStream` 时主动轮询而非被动等待，与内存无关 |
+
+4 MB HBM 差值的真正来源是 **`ACL_STREAM_FAST_LAUNCH`**：CANN 在 `AclrtCreateStreamWithConfig` 内部、stream 创建时即完成 HBM 的预申请，**完全不经过 torch-npu 的任何分配器**，因此：
 - 不被 `NPUCachingAllocator` 的 `stats.reserved_bytes` 记录
 - 不被 `NPUWorkspaceAllocator` 的统计记录
 - 对 `torch.npu.memory_reserved()` / `torch.npu.memory_allocated()` 不可见
 - 对 `aclrtGetMemInfo(ACL_HBM_MEM)` **可见**
 
-由实验数据反推：`initGlobalStreamState()` 创建 2 条 fast-sync stream，合计消耗 **4 MB HBM**（每条约 2 MB）。
+由实验数据反推：`initGlobalStreamState()` 创建 2 条带 `ACL_STREAM_FAST_LAUNCH` 的 stream，合计消耗 **4 MB HBM**（每条约 2 MB）。
 
 ---
 
@@ -174,11 +179,11 @@ allocate(512KB)
   │         └─ initGlobalStreamState()
   │              ├─ AclrtCreateStreamWithConfig(default_stream,
   │              │       ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC)
-  │              │    └─ CANN 内部：在 HBM 分配 fast-sync 同步缓冲区 ≈ +2 MB
+  │              │    └─ CANN 内部：ACL_STREAM_FAST_LAUNCH 预申请 HBM 内部资源 ≈ +2 MB
   │              │       （torch-npu 不可见）
   │              └─ AclrtCreateStreamWithConfig(secondary_stream,
   │                      ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC)
-  │                   └─ CANN 内部：在 HBM 分配 fast-sync 同步缓冲区 ≈ +2 MB
+  │                   └─ CANN 内部：ACL_STREAM_FAST_LAUNCH 预申请 HBM 内部资源 ≈ +2 MB
   │                      （torch-npu 不可见）
   │
   │       stream 初始化 HBM 小计：+4 MB（不计入 PyTorch 任何统计）
