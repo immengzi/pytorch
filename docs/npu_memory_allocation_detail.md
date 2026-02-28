@@ -10,12 +10,12 @@ sizes = [512KB, 512KB, 1KB, 2KB, 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB
 
 设备：Atlas A2 训练系列，torch-npu **2.8.0**，`kMinBlockSize = 512 B`。
 
-实测输出：
+实测输出（括号内为相对上一行的变化量，Δ 表示差值）：
 
 ```
 初始 HBM used：396.16 MB   PT allocated：0.00 MB   PT reserved：0.00 MB
 
-分配  1（512KB）：HBM used=402.16 MB (+6.00)   PT allocated=0.50 MB   PT reserved=2.00 MB
+分配  1（512KB）：HBM used=402.16 MB (Δ+6.00)   PT allocated=0.50 MB   PT reserved=2.00 MB
 分配  2（512KB）：HBM used=402.16 MB (+0.00)   PT allocated=1.00 MB   PT reserved=2.00 MB
 分配  3（  1KB）：HBM used=402.16 MB (+0.00)   PT allocated=1.00 MB   PT reserved=2.00 MB
 ...（中间分配省略，HBM/PT reserved 均无变化）
@@ -51,9 +51,21 @@ constexpr size_t kSmallBuffer = 2097152;   // 2 MB：小分配段大小
 constexpr size_t kLargeBuffer = 20971520;  // 20 MB：中等分配段大小
 ```
 
-本次测试的所有 13 个请求均 ≤ 512 KB（< 1 MB），全部走**小池**，每次向驱动申请的段大小固定为 **2 MB**。
+本次测试的所有 13 个请求均 ≤ 512 KB，圆整后均 ≤ 524,800 B（< kSmallSize = 1 MB），全部走**小池**，每次向驱动申请的段大小固定为 **2 MB**。
 
-> `get_allocation_size()` 的输入是原始请求大小（用于判断走哪个池、申请多大的段）。`round_size()` 的输出（见第四节）用于在段内划分块边界，二者作用不同。
+`malloc()` 内的实际调用顺序如下（`NPUCachingAllocator.cpp:1191-1198`）：
+
+```cpp
+auto size = round_size(orig_size);        // (1) 先圆整原始请求大小
+auto &pool = get_pool(size, stream);      // (2) 以圆整后 size 选择小池/大池
+const size_t alloc_size =
+    get_allocation_size(size);            // (3) 以圆整后 size 确定段大小
+AllocParams params(device, size, stream, &pool, alloc_size, stats);
+```
+
+`get_pool()` 和 `get_allocation_size()` 的输入都是 `round_size()` 的输出，**不是**原始请求大小。池的选择阈值（`kSmallSize = 1 MB`）比较的是圆整后的大小。
+
+> **边界注意**：若请求大小恰好为 1 MB（= kSmallSize），`round_size` 加 32 字节后圆整将超过 1 MB，导致走**大池**（20 MB 段），而非小池。本例最大请求为 512 KB，不触发此边界。
 
 ---
 
@@ -288,7 +300,7 @@ for_each_selected_stat_type(p.stat_types, [&](size_t stat_type) {
 
 ### 6.2 逐步演进
 
-| # | HBM 实际占用 | HBM Δ | PT reserved | PT reserved Δ | PT allocated |
+| # | HBM 实际占用 | HBM Δ（变化量）| PT reserved | PT reserved Δ（变化量）| PT allocated |
 |--:|--:|--:|--:|--:|--:|
 | 初始 | 396.16 MB | — | 0 MB | — | 0 MB |
 | 1 | 402.16 MB | **+6.00 MB** | 2.00 MB | +2.00 MB | 0.50 MB |
