@@ -8,7 +8,7 @@
 sizes = [512KB, 512KB, 1KB, 2KB, 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB, 2KB]
 ```
 
-设备：Atlas A2 训练系列，torch-npu **2.8.0**，`kMinBlockSize = 512 B`。
+设备：Atlas A3 训练系列，torch-npu **2.8.0**，`kMinBlockSize = 512 B`。
 
 实测输出（括号内为相对上一行的变化量，Δ 表示差值）：
 
@@ -258,7 +258,7 @@ static void initGlobalStreamState() {
 
 ### 5.2 CANN 内部 HBM 分配
 
-两个 flag 的代价各不相同（引自 CANN 官方文档）：
+两个 flag 的代价各不相同（引自 [CANN 官方文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/API/appdevgapi/aclcppdevg_03_0069.html)）：
 
 | flag | 代价 |
 |---|---|
@@ -451,3 +451,4 @@ if ret != 0:
 
 print("Resources released successfully.")
 ```
+
