@@ -216,8 +216,8 @@ size_t CachingAllocatorConfig::parseSegmentSizeMb(const std::vector<std::string>
     if (++i < config.size()) {
         TORCH_CHECK(isDigit(config[i]), "CachingAllocator option segment_size_mb is invalid.");
         size_t val = static_cast<size_t>(stoi(config[i]));
-        TORCH_CHECK(val >= 1 && val <= k512MB,
-                    "CachingAllocator option segment_size_mb error, must be [1, 512], dtype is int",
+        TORCH_CHECK(val >= k20MB && val <= k512MB,
+                    "CachingAllocator option segment_size_mb error, must be [20, 512], dtype is int",
                     OPS_ERROR(ErrCode::VALUE));
         m_segment_size_mb = val * kMB;
     } else {

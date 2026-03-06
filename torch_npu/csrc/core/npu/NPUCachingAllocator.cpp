@@ -2428,16 +2428,6 @@ private:
         if (size <= kSmallSize) {
             return kSmallBuffer;
         } else if (size < kMinLargeAlloc) {
-            // Honour user-configured segment_size_mb when set.
-            // This is key for pluggable allocators (e.g. SHMEM) that want
-            // to receive smaller segments so their fine-grained pool
-            // algorithms can operate below the default 20 MiB granularity.
-            auto custom = CachingAllocatorConfig::segment_size_mb();
-            if (custom > 0) {
-                // Round up to the custom segment size, but never shrink
-                // below the actual requested size.
-                return std::max(size, custom);
-            }
             return kLargeBuffer;
         } else {
             return kRoundLarge * ((size + kRoundLarge - 1) / kRoundLarge);
