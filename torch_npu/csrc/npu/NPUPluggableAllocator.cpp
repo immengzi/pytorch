@@ -86,6 +86,25 @@ void NPUPluggableAllocator::set_reset_peak_status_fn(
     reset_peak_status_fn_ = std::move(reset_peak_status_fn);
 }
 
+void NPUPluggableAllocator::set_begin_allocate_to_pool_fn(
+    std::function<void(c10::DeviceIndex, c10_npu::MempoolId_t,
+                       std::function<bool(aclrtStream)>)> fn)
+{
+    begin_allocate_to_pool_fn_ = std::move(fn);
+}
+
+void NPUPluggableAllocator::set_end_allocate_to_pool_fn(
+    std::function<void(c10::DeviceIndex, c10_npu::MempoolId_t)> fn)
+{
+    end_allocate_to_pool_fn_ = std::move(fn);
+}
+
+void NPUPluggableAllocator::set_release_pool_fn(
+    std::function<void(c10::DeviceIndex, c10_npu::MempoolId_t)> fn)
+{
+    release_pool_fn_ = std::move(fn);
+}
+
 void* NPUPluggableAllocator::malloc(
     size_t size,
     int device,
@@ -284,35 +303,37 @@ c10_npu::NPUCachingAllocator::SnapshotInfo NPUPluggableAllocator::snapshot()
 }
 
 // CUDAGraph interactions
+// When no callback is registered these are intentional no-ops: pluggable
+// allocators that manage their own memory (e.g. SHMEM) do not need the
+// caching-allocator pool bookkeeping to perform correct NPU graph capture
+// and replay.  Callers may register custom callbacks via
+// set_begin/end/release_pool_fn for full pool semantics.
 void NPUPluggableAllocator::beginAllocateToPool(
     c10::DeviceIndex device,
     c10_npu::MempoolId_t mempool_id,
     std::function<bool(aclrtStream)> filter)
 {
-    TORCH_CHECK(
-        false,
-        "NPUPluggableAllocator does not yet support beginAllocateToPool. "
-        "If you need it, please file an issue describing your use case.");
+    if (begin_allocate_to_pool_fn_) {
+        begin_allocate_to_pool_fn_(device, mempool_id, std::move(filter));
+    }
 }
 
 void NPUPluggableAllocator::endAllocateToPool(
     c10::DeviceIndex device,
     c10_npu::MempoolId_t mempool_id)
 {
-    TORCH_CHECK(
-        false,
-        "NPUPluggableAllocator does not yet support endAllocateToPool. "
-        "If you need it, please file an issue describing your use case.");
+    if (end_allocate_to_pool_fn_) {
+        end_allocate_to_pool_fn_(device, mempool_id);
+    }
 }
 
 void NPUPluggableAllocator::releasePool(
     c10::DeviceIndex device,
     c10_npu::MempoolId_t mempool_id)
 {
-    TORCH_CHECK(
-        false,
-        "NPUPluggableAllocator does not yet support releasePool. "
-        "If you need it, please file an issue describing your use case.");
+    if (release_pool_fn_) {
+        release_pool_fn_(device, mempool_id);
+    }
 }
 
 void NPUPluggableAllocator::FreeDeviceCachedMemory(int device)
