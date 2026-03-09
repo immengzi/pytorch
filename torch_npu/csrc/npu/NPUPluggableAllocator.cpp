@@ -259,7 +259,6 @@ c10_npu::NPUCachingAllocator::DeviceStats NPUPluggableAllocator::getDeviceStats(
         return get_device_stats_fn_(device);
     } else {
         TORCH_NPU_WARN("get_device_stats_fn_ is not define, please set by set_get_device_stats_fn");
-        return c10_npu::NPUCachingAllocator::DeviceStats{};
     }
 }
 
@@ -282,7 +281,6 @@ c10_npu::NPUCachingAllocator::SnapshotInfo NPUPluggableAllocator::snapshot()
 {
     TORCH_NPU_WARN("NPUPluggableAllocator does not yet support snapshot. "
                   "If you need it, please file an issue describing your use case.");
-    return c10_npu::NPUCachingAllocator::SnapshotInfo{};
 }
 
 // CUDAGraph interactions
