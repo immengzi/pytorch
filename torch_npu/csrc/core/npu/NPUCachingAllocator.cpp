@@ -89,7 +89,6 @@ C10_DEFINE_REGISTRY(FreeNPUMemoryCallbacksRegistry, FreeMemoryCallback);
 namespace {
 using stream_set = ska::flat_hash_set<c10_npu::NPUStream>;
 
-constexpr size_t kMinBlockSize = 512;                 // all sizes are rounded to at least 512 bytes
 constexpr size_t kSmallSize = 1048576;                // largest "small" allocation is 1 MiB
 constexpr size_t kExtraLargeBuffer = 1073741824;      // "extra large" allocations may be packed in 1 GB blocks
 constexpr size_t kMinLargeAlloc = 10485760;           // allocations between 1 and 10 MiB may use kLargeBuffer
@@ -2019,16 +2018,17 @@ public:
     static size_t round_size(size_t size)
     {
         constexpr size_t kPadSize = 32;
+        const size_t min_block_size = CachingAllocatorConfig::min_block_size();
         size += kPadSize;
 
-        if (size < kMinBlockSize) {
-            return kMinBlockSize;
+        if (size < min_block_size) {
+            return min_block_size;
         } else {
             auto divisions = CachingAllocatorConfig::roundup_power2_divisions(size);
-            if (divisions > 1 && size > (kMinBlockSize * divisions)) {
+            if (divisions > 1 && size > (min_block_size * divisions)) {
                 return roundup_power2_next_division(size, divisions);
             } else {
-                return kMinBlockSize * ((size + kMinBlockSize - 1) / kMinBlockSize);
+                return min_block_size * ((size + min_block_size - 1) / min_block_size);
             }
         }
     }
@@ -2403,7 +2403,7 @@ private:
     {
         size_t remaining = block->size - size;
         if (block->pool->is_small || CachingAllocatorConfig::expandable_segments()) {
-            return remaining >= kMinBlockSize;
+            return remaining >= CachingAllocatorConfig::min_block_size();
         } else {
             return (size < CachingAllocatorConfig::max_split_size()) && (remaining > kSmallSize);
         }

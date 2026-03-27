@@ -5,6 +5,8 @@
 
 namespace c10_npu {
 namespace NPUCachingAllocator {
+constexpr size_t kMinBlockSize = 512;                 // default allocator granularity
+constexpr size_t kMinBlockSizeLowerBound = 16;        // configurable allocator granularity lower bound
 constexpr size_t kAlignRoundLarge = 16384;            // round up large allocs to 16 KB
 constexpr size_t kSmallBuffer = 2097152;              // "small" allocations are packed in 2 MiB blocks
 constexpr size_t kLargeBuffer = 20971520;             // "large" allocations may be packed in 20 MiB blocks
@@ -42,6 +44,11 @@ public:
         return instance().m_base_addr_aligned_size;
     }
 
+    static size_t min_block_size()
+    {
+        return instance().m_min_block_size;
+    }
+
     static bool page_size_1g_enable()
     {
         return instance().m_page_size_1g;
@@ -74,6 +81,7 @@ private:
     bool m_pin_memory_expandable_segments;
     bool set_expandable_segments_flag = false;
     size_t m_base_addr_aligned_size = kAlignRoundLarge;
+    size_t m_min_block_size = kMinBlockSize;
     bool m_page_size_1g = false; // 新增1G页配置标志
     size_t m_segment_size_mb;
     std::vector<size_t> m_roundup_power2_divisions;
@@ -84,6 +92,7 @@ private:
           m_expandable_segments(false),
           m_pin_memory_expandable_segments(false),
           m_base_addr_aligned_size(kAlignRoundLarge),
+          m_min_block_size(kMinBlockSize),
           m_segment_size_mb(0),
           m_roundup_power2_divisions(kRoundUpPowerOfTwoIntervals, 0)
     {}
@@ -95,6 +104,7 @@ private:
     size_t parseExpandableSegments(const std::vector<std::string> &config, size_t i);
     size_t parsePinMemoryExpandableSegments(const std::vector<std::string> &config, size_t i);
     size_t parseAddrAlignSize(const std::vector<std::string> &config, size_t i);
+    size_t parseMinBlockSize(const std::vector<std::string> &config, size_t i);
     size_t parsePageSize(const std::vector<std::string> &config, size_t i);
     size_t parseSegmentSizeMb(const std::vector<std::string> &config, size_t i);
     size_t parseRoundUpPower2Divisions(const std::vector<std::string> &config, size_t i);

@@ -153,6 +153,26 @@ size_t CachingAllocatorConfig::parseAddrAlignSize(const std::vector<std::string>
     return i;
 }
 
+size_t CachingAllocatorConfig::parseMinBlockSize(const std::vector<std::string> &config, size_t i)
+{
+    consumeToken(config, ++i, ':');
+    if (++i < config.size()) {
+        TORCH_CHECK(isDigit(config[i]), "CachingAllocator option min_block_size is invalid.");
+        size_t val = static_cast<size_t>(stoi(config[i]));
+        TORCH_CHECK(config[i].length() == std::to_string(val).length(),
+            "CachingAllocator option min_block_size error, must be a power of 2 in [16, 512], dtype is int",
+            OPS_ERROR(ErrCode::VALUE));
+        TORCH_CHECK(val >= kMinBlockSizeLowerBound && val <= kMinBlockSize &&
+                    ((val & (val - 1)) == 0),
+            "CachingAllocator option min_block_size error, must be a power of 2 in [16, 512]",
+            OPS_ERROR(ErrCode::VALUE));
+        m_min_block_size = val;
+    } else {
+        TORCH_CHECK(false, "Error, expecting min_block_size value", OPS_ERROR(ErrCode::VALUE));
+    }
+    return i;
+}
+
 size_t CachingAllocatorConfig::parsePageSize(const std::vector<std::string> &config, size_t i)
 {
     TORCH_CHECK(i + 2 < config.size(), "page_size requires format 'page_size:1g'", OPS_ERROR(ErrCode::VALUE));
@@ -276,6 +296,7 @@ void CachingAllocatorConfig::parseArgs(const char *env, std::set<std::string> su
     // If empty, set the default values
     m_max_split_size = std::numeric_limits<size_t>::max();
     m_garbage_collection_threshold = 0;
+    m_min_block_size = kMinBlockSize;
     m_roundup_power2_divisions.assign(kRoundUpPowerOfTwoIntervals, 0);
 
     if (env == nullptr) {
@@ -303,6 +324,8 @@ void CachingAllocatorConfig::parseArgs(const char *env, std::set<std::string> su
             i = parsePinMemoryExpandableSegments(config, i);
         } else if (config[i] == "base_addr_aligned_kb") {
             i = parseAddrAlignSize(config, i);
+        } else if (config[i] == "min_block_size") {
+            i = parseMinBlockSize(config, i);
         } else if (config[i] == "page_size") {
             i = parsePageSize(config, i);
         } else if (config[i] == "segment_size_mb") {
