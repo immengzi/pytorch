@@ -85,7 +85,8 @@ C10_DEFINE_REGISTRY(FreeNPUMemoryCallbacksRegistry, FreeMemoryCallback);
 namespace {
 using stream_set = ska::flat_hash_set<c10_npu::NPUStream>;
 
-constexpr size_t kMinBlockSize = 512;                 // all sizes are rounded to at least 512 bytes
+constexpr size_t kMinBlockSize = 512;                 // default allocator granularity
+constexpr size_t kMinBlockSizeLowerBound = 16;        // configurable allocator granularity lower bound
 constexpr size_t kSmallSize = 1048576;                // largest "small" allocation is 1 MiB
 constexpr size_t kSmallBuffer = 2097152;              // "small" allocations are packed in 2 MiB blocks
 constexpr size_t kLargeBuffer = 20971520;             // "large" allocations may be packed in 20 MiB blocks
@@ -875,6 +876,11 @@ public:
         return instance().m_base_addr_aligned_size;
     }
 
+    static size_t min_block_size()
+    {
+        return instance().m_min_block_size;
+    }
+
     static bool page_size_1g_enable()
     {
         return instance().m_page_size_1g;
@@ -904,6 +910,7 @@ private:
     bool m_expandable_segments;
     bool set_expandable_segments_flag = false;
     size_t m_base_addr_aligned_size = kAlignRoundLarge;
+    size_t m_min_block_size = kMinBlockSize;
     bool m_page_size_1g = false; // 新增1G页配置标志
     size_t m_segment_size_mb;
 
@@ -912,6 +919,7 @@ private:
           m_garbage_collection_threshold(0),
           m_expandable_segments(false),
           m_base_addr_aligned_size(kAlignRoundLarge),
+          m_min_block_size(kMinBlockSize),
           m_segment_size_mb(0)
     {}
 
@@ -921,6 +929,7 @@ private:
     size_t parseGarbageCollectionThreshold(const std::vector<std::string> &config, size_t i);
     size_t parseExpandableSegments(const std::vector<std::string> &config, size_t i);
     size_t parseAddrAlignSize(const std::vector<std::string> &config, size_t i);
+    size_t parseMinBlockSize(const std::vector<std::string> &config, size_t i);
     size_t parsePageSize(const std::vector<std::string> &config, size_t i);
     size_t parseSegmentSizeMb(const std::vector<std::string> &config, size_t i);
 };
@@ -1027,6 +1036,25 @@ size_t CachingAllocatorConfig::parseAddrAlignSize(const std::vector<std::string>
     return i;
 }
 
+size_t CachingAllocatorConfig::parseMinBlockSize(const std::vector<std::string> &config, size_t i)
+{
+    consumeToken(config, ++i, ':');
+    if (++i < config.size()) {
+        size_t val = static_cast<size_t>(stoi(config[i]));
+        TORCH_CHECK(config[i].length() == std::to_string(val).length(),
+            "CachingAllocator option min_block_size error, must be a power of 2 in [16, 512], dtype is int",
+            OPS_ERROR(ErrCode::VALUE));
+        TORCH_CHECK(val >= kMinBlockSizeLowerBound && val <= kMinBlockSize &&
+                    ((val & (val - 1)) == 0),
+            "CachingAllocator option min_block_size error, must be a power of 2 in [16, 512]",
+            OPS_ERROR(ErrCode::VALUE));
+        m_min_block_size = val;
+    } else {
+        TORCH_CHECK(false, "Error, expecting min_block_size value", OPS_ERROR(ErrCode::VALUE));
+    }
+    return i;
+}
+
 size_t CachingAllocatorConfig::parsePageSize(const std::vector<std::string> &config, size_t i)
 {
     TORCH_CHECK(i + 2 < config.size(), "page_size requires format 'page_size:1g'", OPS_ERROR(ErrCode::VALUE));
@@ -1057,6 +1085,7 @@ void CachingAllocatorConfig::parseArgs(const char *env)
     // If empty, set the default values
     m_max_split_size = std::numeric_limits<size_t>::max();
     m_garbage_collection_threshold = 0;
+    m_min_block_size = kMinBlockSize;
 
     if (env == nullptr) {
         return;
@@ -1075,6 +1104,8 @@ void CachingAllocatorConfig::parseArgs(const char *env)
             i = parseExpandableSegments(config, i);
         } else if (config[i] == "base_addr_aligned_kb") {
             i = parseAddrAlignSize(config, i);
+        } else if (config[i] == "min_block_size") {
+            i = parseMinBlockSize(config, i);
         } else if (config[i] == "page_size") {
             i = parsePageSize(config, i);
         } else if (config[i] == "segment_size_mb") {
@@ -2179,11 +2210,12 @@ public:
 
     static size_t round_size(size_t size)
     {
+        const size_t min_block_size = CachingAllocatorConfig::min_block_size();
         size = size + 32;
-        if (size < kMinBlockSize) {
-            return kMinBlockSize;
+        if (size < min_block_size) {
+            return min_block_size;
         } else {
-            return kMinBlockSize * ((size + kMinBlockSize - 1) / kMinBlockSize);
+            return min_block_size * ((size + min_block_size - 1) / min_block_size);
         }
     }
 
@@ -2548,7 +2580,7 @@ private:
     {
         size_t remaining = block->size - size;
         if (block->pool->is_small || CachingAllocatorConfig::expandable_segments()) {
-            return remaining >= kMinBlockSize;
+            return remaining >= CachingAllocatorConfig::min_block_size();
         } else {
             return (size < CachingAllocatorConfig::max_split_size()) && (remaining > kSmallSize);
         }
