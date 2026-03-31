@@ -2017,9 +2017,7 @@ public:
 
     static size_t round_size(size_t size)
     {
-        constexpr size_t kPadSize = 32;
         const size_t min_block_size = CachingAllocatorConfig::min_block_size();
-        size += kPadSize;
 
         if (size < min_block_size) {
             return min_block_size;
@@ -3445,7 +3443,7 @@ public:
         if (size != 0) {
             if (c10_npu::option::OptionsManager::CheckForceUncached()) {
                 deleteFunc = &uncached_delete;
-                size_t alloc_size = size + 32;
+                size_t alloc_size = size;
                 NPU_CHECK_ERROR(c10_npu::acl::AclrtMallocAlign32(&devPtr, alloc_size,
                     aclrtMemMallocPolicy::ACL_MEM_MALLOC_HUGE_FIRST));
                 ASCEND_LOGD("Without NPUCachingAllocator, malloc by "
@@ -3473,7 +3471,7 @@ public:
         if (size != 0) {
             if (c10_npu::option::OptionsManager::CheckForceUncached()) {
                 deleteFunc = &uncached_delete;
-                size_t alloc_size = size + 32 + aligned;
+                size_t alloc_size = size + aligned;
                 NPU_CHECK_ERROR(c10_npu::acl::AclrtMallocAlign32(&realPtr, alloc_size,
                                                                  aclrtMemMallocPolicy::ACL_MEM_MALLOC_HUGE_FIRST));
                 ASCEND_LOGD("Without NPUCachingAllocator, malloc by "
