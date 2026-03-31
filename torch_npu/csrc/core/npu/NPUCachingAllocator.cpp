@@ -114,6 +114,11 @@ enum ShareableHandleType : char {
 
 using StatTypes = std::array<bool, static_cast<size_t>(StatType::NUM_TYPES)>;
 
+struct RoundSizeResult {
+    size_t size = 0;
+    size_t granularity = 0;
+};
+
 void update_stat(Stat &stat, int64_t amount)
 {
     stat.current += amount;
@@ -150,6 +155,32 @@ void update_stat_array(StatArray &stat_array, int64_t amount, const StatTypes &s
 {
     for_each_selected_stat_type(stat_types,
         [&stat_array, amount](size_t stat_type) { update_stat(stat_array[stat_type], amount); });
+}
+
+void update_stat_array_map(StatArrayMap &stat_map, size_t key, int64_t amount, const StatTypes &stat_types)
+{
+    if (amount == 0) {
+        return;
+    }
+    update_stat_array(stat_map[key], amount, stat_types);
+}
+
+void reset_accumulated_stat_array_map(StatArrayMap &stat_map)
+{
+    for (auto &[_, stat_array] : stat_map) {
+        for (auto &stat : stat_array) {
+            reset_accumulated_stat(stat);
+        }
+    }
+}
+
+void reset_peak_stat_array_map(StatArrayMap &stat_map)
+{
+    for (auto &[_, stat_array] : stat_map) {
+        for (auto &stat : stat_array) {
+            reset_peak_stat(stat);
+        }
+    }
 }
 
 bool IsMallocPage1GMem(bool is_small_pool)
@@ -212,6 +243,9 @@ struct Block {
     stream_set stream_uses; // streams on which the block was used
     size_t size;            // block size in bytes
     size_t requested_size;  // memory originally requested
+    size_t rounded_size;    // memory request size after allocator rounding
+    size_t rounding_size;   // bytes introduced by allocator rounding
+    size_t rounding_granularity; // allocator rounding granularity in bytes
     BlockPool *pool;        // owning memory pool
     void *ptr;              // memory address
     bool allocated;         // in-use flag
@@ -241,6 +275,9 @@ struct Block {
           stream_uses(),
           size(size),
           requested_size(0),
+          rounded_size(0),
+          rounding_size(0),
+          rounding_granularity(0),
           pool(pool),
           ptr(ptr),
           allocated(0),
@@ -257,6 +294,9 @@ struct Block {
           stream_uses(),
           size(size),
           requested_size(0),
+          rounded_size(0),
+          rounding_size(0),
+          rounding_granularity(0),
           pool(nullptr),
           ptr(nullptr),
           allocated(0),
@@ -746,6 +786,8 @@ struct AllocParams {
     Block search_key;
     BlockPool *pool;
     size_t alloc_size;
+    size_t rounding_size = 0;
+    size_t rounding_granularity = 0;
     Block *block;
     StatTypes stat_types = { false };
     aclError err;
@@ -1174,7 +1216,8 @@ public:
             //    effect on memory use during capture should be small.
             process_events(context);
         }
-        auto size = round_size(orig_size);
+        const auto round_result = round_size(orig_size);
+        auto size = round_result.size;
         auto &pool = get_pool(size, stream);
 
         // 开环境变量 大池子放1G内存块
@@ -1182,6 +1225,8 @@ public:
             kExtraLargeBuffer * ((size + kExtraLargeBuffer - 1) / kExtraLargeBuffer) :
             get_allocation_size(size);
         AllocParams params(device, size, stream, &pool, alloc_size, stats);
+        params.rounding_size = size - orig_size;
+        params.rounding_granularity = round_result.granularity;
         params.stat_types = get_stat_types_for_pool(pool);
 
         // First, try to get a block from the existing pool.
@@ -1356,6 +1401,9 @@ public:
 
         block->allocated = true;
         block->requested_size = orig_size;
+        block->rounded_size = size;
+        block->rounding_size = params.rounding_size;
+        block->rounding_granularity = params.rounding_granularity;
         if (block->is_safe == false) {
             ASCEND_LOGI("Unsafe memory block is passively refreshed by releasing and mallocing memory again");
         }
@@ -1373,7 +1421,13 @@ public:
             update_stat(stats.active[stat_type], 1);
             update_stat(stats.active_bytes[stat_type], static_cast<std::int64_t>(block->size));
             update_stat(stats.requested_bytes[stat_type], static_cast<std::int64_t>(block->requested_size));
+            update_stat(stats.rounding_bytes[stat_type], static_cast<std::int64_t>(block->rounding_size));
         });
+        update_stat_array_map(
+            stats.rounding_bytes_by_granularity,
+            block->rounding_granularity,
+            static_cast<std::int64_t>(block->rounding_size),
+            params.stat_types);
 
         if (block->size >= CachingAllocatorConfig::max_split_size()) {
             update_stat(stats.oversize_allocations, 1);
@@ -1630,7 +1684,9 @@ public:
             reset_accumulated_stat(stats.active_bytes[statType]);
             reset_accumulated_stat(stats.inactive_split_bytes[statType]);
             reset_accumulated_stat(stats.requested_bytes[statType]);
+            reset_accumulated_stat(stats.rounding_bytes[statType]);
         }
+        reset_accumulated_stat_array_map(stats.rounding_bytes_by_granularity);
 
         stats.num_alloc_retries = 0;
         stats.num_ooms = 0;
@@ -1653,7 +1709,9 @@ public:
             reset_peak_stat(stats.active_bytes[statType]);
             reset_peak_stat(stats.inactive_split_bytes[statType]);
             reset_peak_stat(stats.requested_bytes[statType]);
+            reset_peak_stat(stats.rounding_bytes[statType]);
         }
+        reset_peak_stat_array_map(stats.rounding_bytes_by_granularity);
 
         reset_peak_stat(stats.oversize_allocations);
         reset_peak_stat(stats.oversize_segments);
@@ -2015,20 +2073,25 @@ public:
         return (round_size_floor == size) ? size : round_size_floor + power2_division;
     }
 
-    static size_t round_size(size_t size)
+    static RoundSizeResult round_size(size_t size)
     {
         constexpr size_t kPadSize = 32;
         const size_t min_block_size = CachingAllocatorConfig::min_block_size();
         size += kPadSize;
 
         if (size < min_block_size) {
-            return min_block_size;
+            return {min_block_size, min_block_size};
         } else {
             auto divisions = CachingAllocatorConfig::roundup_power2_divisions(size);
             if (divisions > 1 && size > (min_block_size * divisions)) {
-                return roundup_power2_next_division(size, divisions);
+                size_t power2_floor = c10::llvm::PowerOf2Floor(size);
+                size_t power2_division = power2_floor >> (63 - c10::llvm::countLeadingZeros(divisions));
+                if (C10_UNLIKELY(power2_division == 0)) {
+                    return {roundup_power2_next_division(size, divisions), power2_floor};
+                }
+                return {roundup_power2_next_division(size, divisions), power2_division};
             } else {
-                return min_block_size * ((size + min_block_size - 1) / min_block_size);
+                return {min_block_size * ((size + min_block_size - 1) / min_block_size), min_block_size};
             }
         }
     }
@@ -2284,6 +2347,8 @@ private:
         size_t original_block_size = block->size;
         auto orig_block_ptr = block->ptr;
         size_t requested_size = block->requested_size;
+        size_t rounding_size = block->rounding_size;
+        size_t rounding_granularity = block->rounding_granularity;
 
         auto &pool = *block->pool;
         int64_t net_change_inactive_split_blocks = 0;
@@ -2321,7 +2386,13 @@ private:
             update_stat(stats.active[stat_type], -1);
             update_stat(stats.active_bytes[stat_type], -original_block_size);
             update_stat(stats.requested_bytes[stat_type], -static_cast<std::int64_t>(requested_size));
+            update_stat(stats.rounding_bytes[stat_type], -static_cast<std::int64_t>(rounding_size));
         });
+        update_stat_array_map(
+            stats.rounding_bytes_by_granularity,
+            rounding_granularity,
+            -static_cast<std::int64_t>(rounding_size),
+            stat_types);
 #ifndef BUILD_LIBTORCH
         torch_npu::profiler::reportMemoryDataToNpuProfiler({ static_cast<int8_t>(c10::DeviceType::PrivateUse1),
             block->device, static_cast<uint8_t>(torch_npu::profiler::MemoryComponentType::CACHING_ALLOCATOR),

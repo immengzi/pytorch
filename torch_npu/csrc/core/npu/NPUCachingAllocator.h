@@ -11,6 +11,7 @@
 
 #include <mutex>
 #include <atomic>
+#include <map>
 
 std::string format_size(uint64_t size);
 
@@ -59,6 +60,7 @@ enum struct StatType : uint64_t {
 };
 
 typedef std::array<Stat, static_cast<size_t>(StatType::NUM_TYPES)> StatArray;
+typedef std::map<size_t, StatArray> StatArrayMap;
 // Struct containing memory allocator summary statistics for a device.
 struct DeviceStats {
     // COUNT: allocations requested by client code
@@ -80,6 +82,10 @@ struct DeviceStats {
     StatArray inactive_split_bytes;
     // SUM: bytes requested by client code
     StatArray requested_bytes;
+    // SUM: bytes added by allocator rounding between requested_bytes and rounded request size
+    StatArray rounding_bytes;
+    // SUM: bytes added by allocator rounding, bucketed by rounding granularity in bytes
+    StatArrayMap rounding_bytes_by_granularity;
 
     // COUNT: total number of failed calls to NPU malloc necessitating cache flushes.
     int64_t num_alloc_retries = 0;

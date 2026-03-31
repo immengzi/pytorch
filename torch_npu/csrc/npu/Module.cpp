@@ -1242,6 +1242,14 @@ PyObject* THNPModule_memoryStats(PyObject *_unused, PyObject *arg)
         return dict;
     };
 
+    const auto statArrayMapToDict = [=](const c10_npu::NPUCachingAllocator::StatArrayMap& statArrayMap) {
+        py::dict dict;
+        for (const auto& [granularity, statArray] : statArrayMap) {
+            dict[py::str(std::to_string(granularity))] = statArrayToDict(statArray);
+        }
+        return dict;
+    };
+
     const DeviceStats stats = c10_npu::NPUCachingAllocator::getDeviceStats(device);
 
     py::dict result;
@@ -1257,6 +1265,8 @@ PyObject* THNPModule_memoryStats(PyObject *_unused, PyObject *arg)
     result["active_bytes"] = statArrayToDict(stats.active_bytes);
     result["inactive_split_bytes"] = statArrayToDict(stats.inactive_split_bytes);
     result["requested_bytes"] = statArrayToDict(stats.requested_bytes);
+    result["rounding_bytes"] = statArrayToDict(stats.rounding_bytes);
+    result["rounding_bytes_by_granularity"] = statArrayMapToDict(stats.rounding_bytes_by_granularity);
     result["oversize_allocations"] = statToDict(stats.oversize_allocations);
     result["oversize_segments"] = statToDict(stats.oversize_segments);
 
