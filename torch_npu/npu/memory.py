@@ -279,6 +279,13 @@ def memory_stats(device=None):
       number of inactive, non-releasable memory blocks.
     - ``"inactive_split_bytes.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:
       amount of inactive, non-releasable memory.
+    - ``"requested_bytes.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:
+      raw bytes requested by client code before allocator rounding.
+    - ``"rounding_bytes.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:
+      bytes added by allocator rounding between requested size and rounded request size.
+    - ``"rounding_bytes_by_granularity.<granularity>.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:
+      same rounding overhead, bucketed by the rounding granularity in bytes
+      (for example ``16``, ``32``, ``512`` or larger power-of-two divisions).
     For these core statistics, values are broken down as follows.
     Pool type:
     - ``all``: combined statistics across all memory pools.
