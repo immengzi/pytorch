@@ -1335,6 +1335,7 @@ public:
 
                 Block *block = new Block(params.device(), params.stream(), size - offset_size, params.pool, align_ptr);
                 block->expandable_segment_ = remaining->expandable_segment_;
+                block->allocation_granularity = remaining->allocation_granularity;
                 block->next = remaining->next;
                 if (block->next) {
                     block->next->prev = block;
