@@ -64,14 +64,14 @@ class Test_roundup_power2_divisions(TestCase):
         do_test(513 * 1024 * 1024, 16) # index:9, division:16
 
     @SupportedDevices(['Ascend910A'])
-    def test_rounding_without_pad32(self):
+    def test_allocator_rounding_with_pad32(self):
         torch.npu.memory.empty_cache()
 
         x = torch.from_numpy(np.random.randn(512).astype(np.uint8)).to("npu")
         allocated_bytes = torch.npu.memory_stats()["allocated_bytes.all.current"]
         active_bytes = torch.npu.memory_stats()["active_bytes.all.current"]
         self.assertEqual(allocated_bytes, active_bytes)
-        self.assertEqual(allocated_bytes, 512)
+        self.assertEqual(allocated_bytes, 1024)
 
     @SupportedDevices(['Ascend910A'])
     def test_rounding_bytes_stats(self):
@@ -97,6 +97,30 @@ class Test_roundup_power2_divisions(TestCase):
         self.assertEqual(stats["rounding_bytes.all.current"], 0)
         self.assertEqual(stats["rounding_bytes.all.allocated"], 15 * 1024 * 1024 + 511)
         self.assertEqual(stats["rounding_bytes.all.freed"], 15 * 1024 * 1024 + 511)
+
+    @SupportedDevices(['Ascend910A'])
+    def test_segment_free_bytes_stats(self):
+        torch.npu.memory.empty_cache()
+        torch.npu.reset_peak_memory_stats()
+        torch.npu.reset_accumulated_memory_stats()
+
+        x = torch.from_numpy(np.zeros(513, dtype=np.uint8)).to("npu")
+
+        stats = torch.npu.memory_stats()
+        self.assertEqual(stats["allocated_bytes.all.current"], 1024)
+        self.assertEqual(stats["segment_free_bytes.all.current"], 2 * 1024 * 1024 - 1024)
+        self.assertEqual(
+            stats["segment_free_bytes_by_granularity.2097152.all.current"],
+            2 * 1024 * 1024 - 1024,
+        )
+
+        del x
+        gc.collect()
+        torch.npu.memory.empty_cache()
+
+        stats = torch.npu.memory_stats()
+        self.assertEqual(stats["segment_free_bytes.all.current"], 0)
+        self.assertEqual(stats["segment_free_bytes.all.peak"], 2 * 1024 * 1024)
 
 
 if __name__ == '__main__':

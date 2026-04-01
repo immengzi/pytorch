@@ -246,6 +246,7 @@ struct Block {
     size_t rounded_size;    // memory request size after allocator rounding
     size_t rounding_size;   // bytes introduced by allocator rounding
     size_t rounding_granularity; // allocator rounding granularity in bytes
+    size_t allocation_granularity; // underlying segment allocation granularity in bytes
     BlockPool *pool;        // owning memory pool
     void *ptr;              // memory address
     bool allocated;         // in-use flag
@@ -278,6 +279,7 @@ struct Block {
           rounded_size(0),
           rounding_size(0),
           rounding_granularity(0),
+          allocation_granularity(0),
           pool(pool),
           ptr(ptr),
           allocated(0),
@@ -297,6 +299,7 @@ struct Block {
           rounded_size(0),
           rounding_size(0),
           rounding_granularity(0),
+          allocation_granularity(0),
           pool(nullptr),
           ptr(nullptr),
           allocated(0),
@@ -788,6 +791,7 @@ struct AllocParams {
     size_t alloc_size;
     size_t rounding_size = 0;
     size_t rounding_granularity = 0;
+    size_t allocation_granularity = 0;
     Block *block;
     StatTypes stat_types = { false };
     aclError err;
@@ -1219,14 +1223,14 @@ public:
         const auto round_result = round_size(orig_size);
         auto size = round_result.size;
         auto &pool = get_pool(size, stream);
+        const auto alloc_result = get_segment_allocation_size(size, pool);
 
         // 开环境变量 大池子放1G内存块
-        const size_t alloc_size = IsMallocPage1GMem(pool.is_small) ?
-            kExtraLargeBuffer * ((size + kExtraLargeBuffer - 1) / kExtraLargeBuffer) :
-            get_allocation_size(size);
+        const size_t alloc_size = alloc_result.size;
         AllocParams params(device, size, stream, &pool, alloc_size, stats);
         params.rounding_size = size - orig_size;
         params.rounding_granularity = round_result.granularity;
+        params.allocation_granularity = alloc_result.granularity;
         params.stat_types = get_stat_types_for_pool(pool);
 
         // First, try to get a block from the existing pool.
@@ -1368,6 +1372,7 @@ public:
 
             block = new Block(device, stream, size, pool, block->ptr);
             block->expandable_segment_ = remaining->expandable_segment_;
+            block->allocation_granularity = remaining->allocation_granularity;
             block->prev = remaining->prev;
             if (block->prev) {
                 block->prev->next = block;
@@ -1404,6 +1409,9 @@ public:
         block->rounded_size = size;
         block->rounding_size = params.rounding_size;
         block->rounding_granularity = params.rounding_granularity;
+        if (block->allocation_granularity == 0) {
+            block->allocation_granularity = params.allocation_granularity;
+        }
         if (block->is_safe == false) {
             ASCEND_LOGI("Unsafe memory block is passively refreshed by releasing and mallocing memory again");
         }
@@ -1420,9 +1428,15 @@ public:
             update_stat(stats.allocated_bytes[stat_type], static_cast<std::int64_t>(block->size));
             update_stat(stats.active[stat_type], 1);
             update_stat(stats.active_bytes[stat_type], static_cast<std::int64_t>(block->size));
+            update_stat(stats.segment_free_bytes[stat_type], -static_cast<std::int64_t>(block->size));
             update_stat(stats.requested_bytes[stat_type], static_cast<std::int64_t>(block->requested_size));
             update_stat(stats.rounding_bytes[stat_type], static_cast<std::int64_t>(block->rounding_size));
         });
+        update_stat_array_map(
+            stats.segment_free_bytes_by_granularity,
+            block->allocation_granularity,
+            -static_cast<std::int64_t>(block->size),
+            params.stat_types);
         update_stat_array_map(
             stats.rounding_bytes_by_granularity,
             block->rounding_granularity,
@@ -1683,9 +1697,11 @@ public:
             reset_accumulated_stat(stats.reserved_bytes[statType]);
             reset_accumulated_stat(stats.active_bytes[statType]);
             reset_accumulated_stat(stats.inactive_split_bytes[statType]);
+            reset_accumulated_stat(stats.segment_free_bytes[statType]);
             reset_accumulated_stat(stats.requested_bytes[statType]);
             reset_accumulated_stat(stats.rounding_bytes[statType]);
         }
+        reset_accumulated_stat_array_map(stats.segment_free_bytes_by_granularity);
         reset_accumulated_stat_array_map(stats.rounding_bytes_by_granularity);
 
         stats.num_alloc_retries = 0;
@@ -1708,9 +1724,11 @@ public:
             reset_peak_stat(stats.reserved_bytes[statType]);
             reset_peak_stat(stats.active_bytes[statType]);
             reset_peak_stat(stats.inactive_split_bytes[statType]);
+            reset_peak_stat(stats.segment_free_bytes[statType]);
             reset_peak_stat(stats.requested_bytes[statType]);
             reset_peak_stat(stats.rounding_bytes[statType]);
         }
+        reset_peak_stat_array_map(stats.segment_free_bytes_by_granularity);
         reset_peak_stat_array_map(stats.rounding_bytes_by_granularity);
 
         reset_peak_stat(stats.oversize_allocations);
@@ -2096,6 +2114,26 @@ public:
         }
     }
 
+    static RoundSizeResult get_segment_allocation_size(size_t size, const BlockPool &pool)
+    {
+        if (IsMallocPage1GMem(pool.is_small)) {
+            return {
+                kExtraLargeBuffer * ((size + kExtraLargeBuffer - 1) / kExtraLargeBuffer),
+                kExtraLargeBuffer,
+            };
+        }
+        if (size <= kSmallSize) {
+            return {kSmallBuffer, kSmallBuffer};
+        } else if (size < kMinLargeAlloc) {
+            return {kLargeBuffer, kLargeBuffer};
+        } else {
+            return {
+                kRoundLarge * ((size + kRoundLarge - 1) / kRoundLarge),
+                kRoundLarge,
+            };
+        }
+    }
+
     // See Note [Interaction with NPU graph capture]
 
     // Called by NPUGraph::capture_begin
@@ -2251,6 +2289,7 @@ private:
         }
         candidate->mapped = false;
         candidate->expandable_segment_ = es;
+        candidate->allocation_granularity = segment_size;
         pool->unmapped.insert(candidate);
         return candidate;
     }
@@ -2278,6 +2317,7 @@ private:
                 static_cast<char *>(to_map->ptr) + mapped_range.size);
             remaining->mapped = false;
             remaining->expandable_segment_ = to_map->expandable_segment_;
+            remaining->allocation_granularity = to_map->allocation_granularity;
             remaining->splice(to_map, to_map->next);
             pool.unmapped.insert(remaining);
             to_map->size = mapped_range.size;
@@ -2291,8 +2331,15 @@ private:
         // update statistics
         total_allocated_memory += mapped_range.size;
         StatTypes stat_types = get_stat_types_for_pool(*to_map->pool);
-        for_each_selected_stat_type(stat_types,
-            [&](size_t stat_type) { update_stat(stats.reserved_bytes[stat_type], mapped_range.size); });
+        for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+            update_stat(stats.reserved_bytes[stat_type], mapped_range.size);
+            update_stat(stats.segment_free_bytes[stat_type], mapped_range.size);
+        });
+        update_stat_array_map(
+            stats.segment_free_bytes_by_granularity,
+            to_map->allocation_granularity,
+            static_cast<std::int64_t>(mapped_range.size),
+            stat_types);
         record_trace(TraceEntry::SEGMENT_MAP, int64_t(mapped_range.ptr), mapped_range.size, to_map->stream,
             to_map->device, ctx);
         if (!to_map->prev && !to_map->context_when_segment_allocated) {
@@ -2385,9 +2432,15 @@ private:
             }
             update_stat(stats.active[stat_type], -1);
             update_stat(stats.active_bytes[stat_type], -original_block_size);
+            update_stat(stats.segment_free_bytes[stat_type], original_block_size);
             update_stat(stats.requested_bytes[stat_type], -static_cast<std::int64_t>(requested_size));
             update_stat(stats.rounding_bytes[stat_type], -static_cast<std::int64_t>(rounding_size));
         });
+        update_stat_array_map(
+            stats.segment_free_bytes_by_granularity,
+            block->allocation_granularity,
+            static_cast<std::int64_t>(original_block_size),
+            stat_types);
         update_stat_array_map(
             stats.rounding_bytes_by_granularity,
             rounding_granularity,
@@ -2425,6 +2478,14 @@ private:
             if (dst->next) {
                 dst->next->prev = dst;
             }
+        }
+
+        TORCH_INTERNAL_ASSERT(
+            dst->allocation_granularity == 0 || src->allocation_granularity == 0 ||
+                dst->allocation_granularity == src->allocation_granularity,
+            PTA_ERROR(ErrCode::VALUE));
+        if (dst->allocation_granularity == 0) {
+            dst->allocation_granularity = src->allocation_granularity;
         }
 
         const size_t subsumed_size = src->size;
@@ -2681,10 +2742,17 @@ private:
 
         total_allocated_memory += size;
         p.block = new Block(p.device(), p.stream(), size, p.pool, (char *)ptr);
+        p.block->allocation_granularity = p.allocation_granularity;
         for_each_selected_stat_type(p.stat_types, [&](size_t stat_type) {
             update_stat(stats.segment[stat_type], 1);
             update_stat(stats.reserved_bytes[stat_type], size);
+            update_stat(stats.segment_free_bytes[stat_type], size);
         });
+        update_stat_array_map(
+            stats.segment_free_bytes_by_granularity,
+            p.block->allocation_granularity,
+            static_cast<std::int64_t>(size),
+            p.stat_types);
         if (size >= CachingAllocatorConfig::max_split_size()) {
             update_stat(stats.oversize_segments, 1);
         }
@@ -2816,7 +2884,13 @@ private:
         for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
             update_stat(stats.segment[stat_type], -1);
             update_stat(stats.reserved_bytes[stat_type], -block->size);
+            update_stat(stats.segment_free_bytes[stat_type], -static_cast<std::int64_t>(block->size));
         });
+        update_stat_array_map(
+            stats.segment_free_bytes_by_granularity,
+            block->allocation_granularity,
+            -static_cast<std::int64_t>(block->size),
+            stat_types);
 
         if (block->size >= CachingAllocatorConfig::max_split_size()) {
             update_stat(stats.oversize_segments, -1);
@@ -2842,6 +2916,7 @@ private:
             // prev? -> before_free -> block
             Block *before_free = new Block(block->device, block->stream, before_size, block->pool, block->ptr);
             before_free->expandable_segment_ = block->expandable_segment_;
+            before_free->allocation_granularity = block->allocation_granularity;
             before_free->splice(block->prev, block);
             block->pool->blocks.insert(before_free);
         }
@@ -2852,6 +2927,7 @@ private:
             Block *after_free = new Block(block->device, block->stream, after_size, block->pool,
                 static_cast<char *>(unmapped.ptr) + unmapped.size);
             after_free->expandable_segment_ = block->expandable_segment_;
+            after_free->allocation_granularity = block->allocation_granularity;
             after_free->splice(block, block->next);
             block->pool->blocks.insert(after_free);
         }
@@ -2867,8 +2943,15 @@ private:
         // update statistics
         total_allocated_memory -= unmapped.size;
         StatTypes stat_types = get_stat_types_for_pool(*block->pool);
-        for_each_selected_stat_type(stat_types,
-            [&](size_t stat_type) { update_stat(stats.reserved_bytes[stat_type], -unmapped.size); });
+        for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+            update_stat(stats.reserved_bytes[stat_type], -unmapped.size);
+            update_stat(stats.segment_free_bytes[stat_type], -static_cast<std::int64_t>(unmapped.size));
+        });
+        update_stat_array_map(
+            stats.segment_free_bytes_by_granularity,
+            block->allocation_granularity,
+            -static_cast<std::int64_t>(unmapped.size),
+            stat_types);
 
         if (block->pool->owner_PrivatePool) {
             // The npuFreed block belonged to a NPU graph's PrivatePool.

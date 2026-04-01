@@ -279,6 +279,12 @@ def memory_stats(device=None):
       number of inactive, non-releasable memory blocks.
     - ``"inactive_split_bytes.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:
       amount of inactive, non-releasable memory.
+    - ``"segment_free_bytes.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:
+      bytes currently free inside segments already reserved by the allocator.
+    - ``"segment_free_bytes_by_granularity.<granularity>.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:
+      same free-in-segment bytes, bucketed by the underlying segment allocation
+      granularity in bytes (for example ``2097152`` for 2 MiB or ``20971520``
+      for 20 MiB).
     - ``"requested_bytes.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:
       raw bytes requested by client code before allocator rounding.
     - ``"rounding_bytes.{all,large_pool,small_pool}.{current,peak,allocated,freed}"``:

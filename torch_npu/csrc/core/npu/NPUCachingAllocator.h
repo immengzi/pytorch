@@ -80,6 +80,10 @@ struct DeviceStats {
     StatArray active_bytes;
     // SUM: bytes within inactive, split memory blocks
     StatArray inactive_split_bytes;
+    // SUM: bytes currently free inside segments already reserved by the allocator
+    StatArray segment_free_bytes;
+    // SUM: free bytes inside reserved segments, bucketed by the segment allocation granularity in bytes
+    StatArrayMap segment_free_bytes_by_granularity;
     // SUM: bytes requested by client code
     StatArray requested_bytes;
     // SUM: bytes added by allocator rounding between requested_bytes and rounded request size

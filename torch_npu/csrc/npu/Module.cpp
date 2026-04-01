@@ -1264,6 +1264,8 @@ PyObject* THNPModule_memoryStats(PyObject *_unused, PyObject *arg)
     result["reserved_bytes"] = statArrayToDict(stats.reserved_bytes);
     result["active_bytes"] = statArrayToDict(stats.active_bytes);
     result["inactive_split_bytes"] = statArrayToDict(stats.inactive_split_bytes);
+    result["segment_free_bytes"] = statArrayToDict(stats.segment_free_bytes);
+    result["segment_free_bytes_by_granularity"] = statArrayMapToDict(stats.segment_free_bytes_by_granularity);
     result["requested_bytes"] = statArrayToDict(stats.requested_bytes);
     result["rounding_bytes"] = statArrayToDict(stats.rounding_bytes);
     result["rounding_bytes_by_granularity"] = statArrayMapToDict(stats.rounding_bytes_by_granularity);
